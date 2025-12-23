@@ -113,7 +113,7 @@ export default function BillingSettings() {
       account_number_last4: accountLast4 || null,
       routing_number: routingNumber || null,
       payment_instructions: instructions || null,
-    };
+    }; 
 
 const { error } = await supabase
   .from("workspace_billing_profiles")
