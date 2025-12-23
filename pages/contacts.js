@@ -36,6 +36,7 @@ export default function ContactsPage() {
   const [phone, setPhone] = useState("");
   const [lastTouchDate, setLastTouchDate] = useState("");
   const [notes, setNotes] = useState("");
+  const [isBilling, setIsBilling] = useState(false);
 
   // ---- auth bootstrap ----
   useEffect(() => {
@@ -94,7 +95,7 @@ export default function ContactsPage() {
   async function loadContacts(wsId) {
     let q = supabase
       .from("contacts")
-      .select("id,name,role,company,email,phone,last_touch_date,notes,sponsor_id,created_at")
+      .select("id,name,role,company,email,phone,last_touch_date,notes,sponsor_id,is_billing,created_at")
       .eq("workspace_id", wsId)
       .order("last_touch_date", { ascending: false, nullsFirst: false })
       .order("created_at", { ascending: false });
@@ -140,6 +141,7 @@ export default function ContactsPage() {
     setPhone("");
     setLastTouchDate("");
     setNotes("");
+    setIsBilling(false);
     // keep sponsorId as-is
   }
 
@@ -180,8 +182,23 @@ export default function ContactsPage() {
       phone: phone.trim() || null,
       last_touch_date: lastTouchDate || null,
       notes: notes.trim() || null,
+      is_billing: !!isBilling,
     };
 
+    // If setting this contact as billing, clear existing billing for this sponsor first
+    if (isBilling && sponsorId) {
+    const { error: clearErr } = await supabase
+        .from("contacts")
+        .update({ is_billing: false })
+        .eq("workspace_id", workspaceId)
+        .eq("sponsor_id", sponsorId)
+        .eq("is_billing", true);
+
+    if (clearErr) {
+        setMsg(clearErr.message);
+        return;
+    }
+    }
     const { error } = await supabase.from("contacts").insert(payload);
     if (error) {
       setMsg(error.message);
@@ -201,6 +218,43 @@ export default function ContactsPage() {
     if (error) setMsg(error.message);
     else loadContacts(workspaceId);
   }
+
+  async function setBillingContact(contact) {
+  setMsg("");
+  if (!workspaceId) return;
+
+  if (!contact.sponsor_id) {
+    setMsg("Billing contact must be attached to a sponsor.");
+    return;
+  }
+
+  // Clear any existing billing contact for this sponsor
+  const { error: clearErr } = await supabase
+    .from("contacts")
+    .update({ is_billing: false })
+    .eq("workspace_id", workspaceId)
+    .eq("sponsor_id", contact.sponsor_id)
+    .eq("is_billing", true);
+
+  if (clearErr) {
+    setMsg(clearErr.message);
+    return;
+  }
+
+  // Set this one
+  const { error: setErr } = await supabase
+    .from("contacts")
+    .update({ is_billing: true })
+    .eq("id", contact.id);
+
+  if (setErr) {
+    setMsg(setErr.message);
+    return;
+  }
+
+  await loadContacts(workspaceId);
+}
+
 
   async function deleteContact(id) {
     setMsg("");
@@ -277,14 +331,20 @@ export default function ContactsPage() {
                 return (
                   <div key={c.id} className={ui.item}>
                     <div>
-                      <div className={ui.itemTitle}>{c.name}</div>
+                        <div className={ui.itemTitle} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <span>{c.name}</span>
+                        {c.is_billing ? (
+                            <span style={{ fontSize: 12, fontWeight: 900, opacity: 0.85, border: "1px solid #ddd", padding: "2px 8px", borderRadius: 999 }}>
+                            Billing
+                            </span>
+                        ) : null}
+                        </div>
 
                       <div className={ui.itemMeta}>
                         {sponsor ? `${sponsor} • ` : ""}
                         {c.role ? `${c.role} • ` : ""}
                         {c.company ? c.company : ""}
                       </div>
-
                       {(c.email || c.phone) ? (
                         <div className={ui.itemMeta}>
                           {c.email ? (
@@ -308,6 +368,11 @@ export default function ContactsPage() {
                       <button className={ui.btn} onClick={() => touchToday(c.id)}>
                         Touched today
                       </button>
+                      {c.sponsor_id ? (
+                        <button className={ui.btn} onClick={() => setBillingContact(c)} disabled={!!c.is_billing}>
+                            {c.is_billing ? "Billing contact" : "Make billing"}
+                        </button>
+                        ) : null}
                       <button className={ui.btn} onClick={() => deleteContact(c.id)}>
                         Delete
                       </button>
@@ -322,7 +387,6 @@ export default function ContactsPage() {
 
       <Modal open={showAddModal} title="Add contact" onClose={closeAddModal}>
         <form className={ui.form} onSubmit={addContact}>
-          <div className={ui.formGrid2}>
             <div className={ui.field}>
               <label className={ui.label}>Name</label>
               <input
@@ -334,7 +398,18 @@ export default function ContactsPage() {
               />
             </div>
 
+          <div className={ui.formGrid3}>
             <div className={ui.field}>
+              <label className={ui.label}>Role (optional)</label>
+              <input
+                className={ui.input}
+                value={role}
+                onChange={(e) => setRole(e.target.value)}
+                placeholder="Brand Manager / PR / Agent / RD"
+              />
+            </div>
+
+           <div className={ui.field}>
               <label className={ui.label}>Sponsor (optional)</label>
               <select
                 className={ui.select}
@@ -350,28 +425,6 @@ export default function ContactsPage() {
                 <option value="">(No sponsor)</option>
               </select>
             </div>
-          </div>
-
-          <div className={ui.formGrid3}>
-            <div className={ui.field}>
-              <label className={ui.label}>Role (optional)</label>
-              <input
-                className={ui.input}
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-                placeholder="Brand Manager / PR / Agent / RD"
-              />
-            </div>
-
-            <div className={ui.field}>
-              <label className={ui.label}>Company (optional)</label>
-              <input
-                className={ui.input}
-                value={company}
-                onChange={(e) => setCompany(e.target.value)}
-                placeholder="Nike / UTMB / etc."
-              />
-            </div>
 
             <div className={ui.field}>
               <label className={ui.label}>Last touch date (optional)</label>
@@ -383,6 +436,18 @@ export default function ContactsPage() {
               />
             </div>
           </div>
+          <div className={ui.field} style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <input
+                id="isBilling"
+                type="checkbox"
+                checked={isBilling}
+                onChange={(e) => setIsBilling(e.target.checked)}
+                disabled={!sponsorId} // only meaningful when a sponsor is selected
+            />
+            <label htmlFor="isBilling" className={ui.label} style={{ margin: 0 }}>
+                Billing contact for this sponsor
+            </label>
+        </div>
 
           <div className={ui.formGrid2}>
             <div className={ui.field}>

@@ -45,6 +45,7 @@ export default function TopNav({ active = "" }) {
           <NavLink id="contracts" label="Contracts" href="/contracts" />
           <NavLink id="sponsors" label="Sponsors" href="/sponsors" />
           <NavLink id="contacts" label="Contacts" href="/contacts" />
+          <NavLink id="billing" label="Settings" href="/settings/billing" />
 
           <button
             type="button"

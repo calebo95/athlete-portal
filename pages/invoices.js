@@ -13,6 +13,12 @@ function toISODateInput(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function money(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "0.00";
+  return x.toFixed(2);
+}
+
 export default function InvoicesPage() {
   const router = useRouter();
   const [user, setUser] = useState(null);
@@ -26,15 +32,24 @@ export default function InvoicesPage() {
   // UI
   const [msg, setMsg] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [showAddModal, setShowAddModal] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  // form
+  // modal state
+  const [modalOpen, setModalOpen] = useState(false);
+  const [mode, setMode] = useState("add"); // "add" | "edit"
+  const [editingInvoiceId, setEditingInvoiceId] = useState(null);
+
+  // form (header)
+  const [invoiceNumber, setInvoiceNumber] = useState("");
   const [sponsorId, setSponsorId] = useState("");
   const [contractId, setContractId] = useState("");
-  const [amount, setAmount] = useState("");
   const [status, setStatus] = useState("draft");
   const [sentDate, setSentDate] = useState("");
+  const [paidDate, setPaidDate] = useState("");
   const [notes, setNotes] = useState("");
+
+  // line items
+  const [lineItems, setLineItems] = useState([{ description: "", quantity: "1", unit_price: "" }]);
 
   // ---- auth bootstrap ----
   useEffect(() => {
@@ -52,6 +67,41 @@ export default function InvoicesPage() {
 
     return () => sub.subscription.unsubscribe();
   }, [router]);
+
+async function downloadInvoicePdf(inv) {
+  setMsg("");
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    if (!token) {
+      setMsg("You’re not logged in.");
+      return;
+    }
+
+    const res = await fetch(`/api/invoices/${inv.id}/pdf`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "PDF download failed");
+    }
+
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `Invoice-${inv.invoice_number || inv.id}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    window.URL.revokeObjectURL(url);
+  } catch (e) {
+    setMsg(e.message || "Failed to download PDF.");
+  }
+}
 
   async function loadWorkspaceId() {
     const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
@@ -99,7 +149,28 @@ export default function InvoicesPage() {
   async function loadInvoices(wsId) {
     let q = supabase
       .from("invoices")
-      .select("id,amount,status,sent_date,paid_date,notes,sponsor_id,contract_id,created_at")
+      .select(
+        `
+        id,
+        invoice_number,
+        amount,
+        status,
+        sent_date,
+        paid_date,
+        notes,
+        sponsor_id,
+        contract_id,
+        created_at,
+        invoice_items (
+          id,
+          line_no,
+          description,
+          quantity,
+          unit_price,
+          created_at
+        )
+      `
+      )
       .eq("workspace_id", wsId)
       .order("created_at", { ascending: false });
 
@@ -107,7 +178,13 @@ export default function InvoicesPage() {
 
     const { data, error } = await q;
     if (error) throw error;
-    setInvoices(data || []);
+
+    const normalized = (data || []).map((inv) => ({
+      ...inv,
+      invoice_items: [...(inv.invoice_items || [])].sort((a, b) => (a.line_no ?? 0) - (b.line_no ?? 0)),
+    }));
+
+    setInvoices(normalized);
   }
 
   useEffect(() => {
@@ -155,67 +232,249 @@ export default function InvoicesPage() {
     if (!ok) setContractId("");
   }, [contractId, contractsForSelectedSponsor]);
 
+  const computedTotal = useMemo(() => {
+    let total = 0;
+    for (const li of lineItems) {
+      const qty = Number(li.quantity);
+      const unit = Number(li.unit_price);
+      const q = Number.isFinite(qty) ? qty : 0;
+      const u = Number.isFinite(unit) ? unit : 0;
+      total += q * u;
+    }
+    return total;
+  }, [lineItems]);
+
   // ---- modal helpers ----
   function resetFormDefaults() {
-    setAmount("");
+    setInvoiceNumber("");
     setStatus("draft");
     setSentDate("");
+    setPaidDate("");
     setNotes("");
     setContractId("");
-    // keep sponsorId as-is
+    setLineItems([{ description: "", quantity: "1", unit_price: "" }]);
+    setEditingInvoiceId(null);
   }
 
   function openAddModal() {
     setMsg("");
+    setMode("add");
     if (!sponsorId && sponsors?.length) setSponsorId(sponsors[0].id);
     resetFormDefaults();
-    setShowAddModal(true);
+    setModalOpen(true);
   }
 
-  function closeAddModal() {
-    setShowAddModal(false);
+  function openEditModal(inv) {
+    setMsg("");
+    setMode("edit");
+    setEditingInvoiceId(inv.id);
+
+    setInvoiceNumber(inv.invoice_number || "");
+    setSponsorId(inv.sponsor_id || "");
+    setContractId(inv.contract_id || "");
+    setStatus(inv.status || "draft");
+    setSentDate(inv.sent_date || "");
+    setPaidDate(inv.paid_date || "");
+    setNotes(inv.notes || "");
+
+    const items = (inv.invoice_items || []).length
+      ? inv.invoice_items
+      : [{ description: "", quantity: 1, unit_price: 0 }];
+
+    setLineItems(
+      items.map((it) => ({
+        id: it.id,
+        description: it.description || "",
+        quantity: String(it.quantity ?? 1),
+        unit_price: String(it.unit_price ?? 0),
+      }))
+    );
+
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    if (saving) return;
+    setModalOpen(false);
+  }
+
+  function updateLineItem(idx, patch) {
+    setLineItems((prev) => prev.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
+  }
+
+  function addLineItemRow() {
+    setLineItems((prev) => [...prev, { description: "", quantity: "1", unit_price: "" }]);
+  }
+
+  function removeLineItemRow(idx) {
+    setLineItems((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function normalizeLineItemsForSave() {
+    const cleaned = lineItems
+      .map((li) => ({
+        description: (li.description || "").trim(),
+        quantity: Number(li.quantity),
+        unit_price: Number(li.unit_price),
+      }))
+      .filter((li) => li.description.length > 0);
+
+    if (cleaned.length === 0) return { ok: false, error: "Add at least one line item (description required)." };
+
+    for (const li of cleaned) {
+      if (!Number.isFinite(li.quantity) || li.quantity <= 0) {
+        return { ok: false, error: "Each line item quantity must be a positive number." };
+      }
+      if (!Number.isFinite(li.unit_price) || li.unit_price < 0) {
+        return { ok: false, error: "Each line item unit price must be 0 or greater." };
+      }
+    }
+
+    return { ok: true, items: cleaned };
+  }
+
+  function computeEffectiveDates(nextStatus) {
+    const today = toISODateInput(new Date());
+
+    let nextSent = sentDate || null;
+    let nextPaid = paidDate || null;
+
+    if (nextStatus === "sent") {
+      if (!nextSent) nextSent = today;
+      nextPaid = null;
+    }
+
+    if (nextStatus === "paid") {
+      if (!nextSent) nextSent = today;
+      if (!nextPaid) nextPaid = today;
+    }
+
+    if (nextStatus === "draft") {
+      nextSent = null;
+      nextPaid = null;
+    }
+
+    return { nextSent, nextPaid };
   }
 
   // ---- actions ----
   async function addInvoice(e) {
     e.preventDefault();
     setMsg("");
+    if (saving) return;
 
     if (!workspaceId) {
       setMsg("No workspace loaded. Cannot add invoice.");
       return;
     }
 
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      setMsg("Amount must be a positive number.");
+    const norm = normalizeLineItemsForSave();
+    if (!norm.ok) {
+      setMsg(norm.error);
       return;
     }
 
-    const effectiveSentDate = status === "sent" && !sentDate ? toISODateInput(new Date()) : sentDate || null;
-    const paidDate = status === "paid" ? toISODateInput(new Date()) : null;
+    const cleanInvNo = invoiceNumber.trim() || null;
+    const { nextSent, nextPaid } = computeEffectiveDates(status);
 
+    setSaving(true);
     try {
-      const payload = {
+      const invPayload = {
         workspace_id: workspaceId,
+        invoice_number: cleanInvNo,
         sponsor_id: sponsorId || null,
         contract_id: contractId || null,
-        amount: amt,
+        amount: Number(computedTotal),
         status,
-        sent_date: effectiveSentDate,
-        paid_date: paidDate,
-        created_by: user.id,
+        sent_date: nextSent,
+        paid_date: nextPaid,
         notes: notes.trim() || null,
       };
 
-      const { error } = await supabase.from("invoices").insert(payload);
-      if (error) throw error;
+      const { data: invRow, error: invErr } = await supabase.from("invoices").insert(invPayload).select("id").single();
+      if (invErr) throw invErr;
+
+      const invoiceId = invRow.id;
+
+      const itemsPayload = norm.items.map((li, i) => ({
+        workspace_id: workspaceId,
+        invoice_id: invoiceId,
+        line_no: i + 1,
+        description: li.description,
+        quantity: li.quantity,
+        unit_price: li.unit_price,
+      }));
+
+      const { error: itemsErr } = await supabase.from("invoice_items").insert(itemsPayload);
+      if (itemsErr) throw itemsErr;
 
       resetFormDefaults();
-      setShowAddModal(false);
+      setModalOpen(false);
       await loadInvoices(workspaceId);
     } catch (e2) {
       setMsg(e2.message || "Failed to add invoice.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveInvoiceEdits(e) {
+    e.preventDefault();
+    setMsg("");
+    if (saving) return;
+
+    if (!workspaceId || !editingInvoiceId) {
+      setMsg("No invoice selected.");
+      return;
+    }
+
+    const norm = normalizeLineItemsForSave();
+    if (!norm.ok) {
+      setMsg(norm.error);
+      return;
+    }
+
+    const cleanInvNo = invoiceNumber.trim() || null;
+    const { nextSent, nextPaid } = computeEffectiveDates(status);
+
+    setSaving(true);
+    try {
+      const invPatch = {
+        invoice_number: cleanInvNo,
+        sponsor_id: sponsorId || null,
+        contract_id: contractId || null,
+        amount: Number(computedTotal),
+        status,
+        sent_date: nextSent,
+        paid_date: nextPaid,
+        notes: notes.trim() || null,
+      };
+
+      const { error: upErr } = await supabase.from("invoices").update(invPatch).eq("id", editingInvoiceId);
+      if (upErr) throw upErr;
+
+      const { error: delErr } = await supabase.from("invoice_items").delete().eq("invoice_id", editingInvoiceId);
+      if (delErr) throw delErr;
+
+      const itemsPayload = norm.items.map((li, i) => ({
+        workspace_id: workspaceId,
+        invoice_id: editingInvoiceId,
+        line_no: i + 1,
+        description: li.description,
+        quantity: li.quantity,
+        unit_price: li.unit_price,
+      }));
+
+      const { error: insErr } = await supabase.from("invoice_items").insert(itemsPayload);
+      if (insErr) throw insErr;
+
+      resetFormDefaults();
+      setModalOpen(false);
+      await loadInvoices(workspaceId);
+    } catch (e2) {
+      setMsg(e2.message || "Failed to save invoice edits.");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -223,7 +482,6 @@ export default function InvoicesPage() {
     setMsg("");
     try {
       const patch = { status: nextStatus };
-
       if (nextStatus === "sent") patch.sent_date = toISODateInput(new Date());
       if (nextStatus === "paid") patch.paid_date = toISODateInput(new Date());
 
@@ -248,35 +506,40 @@ export default function InvoicesPage() {
           <div className={ui.sub}>Create, track, and send invoices.</div>
         </div>
 
-        <div className={ui.actionsRow}>
-          <button className={`${ui.btn} ${ui.btnPrimary}`} onClick={openAddModal} disabled={!workspaceId}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button onClick={openAddModal} disabled={!workspaceId} className={`${ui.btn} ${ui.btnPrimary}`}>
             + Add invoice
           </button>
 
-          <label className={`${ui.navLink} ${ui.pill}`}>
-            <input
-              className={ui.checkbox}
-              type="checkbox"
-              checked={showAll}
-              onChange={(e) => setShowAll(e.target.checked)}
-            />
-            Show all
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+            Show all (including paid/void)
           </label>
         </div>
       </div>
 
       {msg ? <div className={ui.notice}>{msg}</div> : null}
 
-      <Modal open={showAddModal} title="Add invoice" onClose={closeAddModal}>
-        <form className={ui.form} onSubmit={addInvoice}>
-          <div className={ui.formGrid2}>
-            <div className={ui.field}>
-              <label className={ui.label}>Sponsor</label>
+      <Modal open={modalOpen} title={mode === "edit" ? "Edit invoice" : "Add invoice"} onClose={closeModal}>
+        <form onSubmit={mode === "edit" ? saveInvoiceEdits : addInvoice} style={{ display: "grid", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Invoice number (optional)</div>
+              <input
+                value={invoiceNumber}
+                onChange={(e) => setInvoiceNumber(e.target.value)}
+                disabled={saving || (mode === "edit" && !!invoiceNumber)}
+                placeholder="INV-001"
+                />
+            </div>
+
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Sponsor</div>
               <select
-                className={ui.select}
+                style={{ width: "100%", marginTop: 6, padding: 10 }}
                 value={sponsorId}
                 onChange={(e) => setSponsorId(e.target.value)}
-                disabled={!sponsors.length || !workspaceId}
+                disabled={!sponsors.length || !workspaceId || saving}
               >
                 {sponsors.length ? null : <option value="">Add a sponsor first</option>}
                 {sponsors.map((s) => (
@@ -287,95 +550,169 @@ export default function InvoicesPage() {
                 <option value="">(No sponsor)</option>
               </select>
             </div>
-
-            <div className={ui.field}>
-              <label className={ui.label}>Contract (optional)</label>
-              <select
-                className={ui.select}
-                value={contractId}
-                onChange={(e) => setContractId(e.target.value)}
-                disabled={!workspaceId}
-              >
-                <option value="">(No contract)</option>
-                {contractsForSelectedSponsor.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {(c.start_date || "—") + " → " + (c.end_date || "—")}
-                  </option>
-                ))}
-              </select>
-            </div>
           </div>
 
-          <div className={ui.formGrid3}>
-            <div className={ui.field}>
-              <label className={ui.label}>Amount</label>
-              <input
-                className={ui.input}
-                type="number"
-                step="0.01"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                placeholder="e.g., 5000"
-                required
-              />
-            </div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Contract (optional)</div>
+            <select
+              style={{ width: "100%", marginTop: 6, padding: 10 }}
+              value={contractId}
+              onChange={(e) => setContractId(e.target.value)}
+              disabled={!workspaceId || saving}
+            >
+              <option value="">(No contract)</option>
+              {contractsForSelectedSponsor.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {(c.start_date || "—") + " → " + (c.end_date || "—")}
+                </option>
+              ))}
+            </select>
+          </div>
 
-            <div className={ui.field}>
-              <label className={ui.label}>Status</label>
-              <select className={ui.select} value={status} onChange={(e) => setStatus(e.target.value)}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Status</div>
+              <select
+                style={{ width: "100%", marginTop: 6, padding: 10 }}
+                value={status}
+                onChange={(e) => setStatus(e.target.value)}
+                disabled={saving}
+              >
                 {STATUS_OPTIONS.map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
                 ))}
               </select>
-              <div className={ui.cardSub}>
-                Tip: use <b>sent</b> for “unpaid” dashboard tracking.
-              </div>
             </div>
 
-            <div className={ui.field}>
-              <label className={ui.label}>Sent date (optional)</label>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Sent date</div>
               <input
-                className={ui.input}
+                style={{ width: "100%", marginTop: 6, padding: 10 }}
                 type="date"
                 value={sentDate}
                 onChange={(e) => setSentDate(e.target.value)}
-                disabled={status !== "sent"}
+                disabled={saving}
               />
-              <div className={ui.cardSub}>If blank, we’ll default to today when status is sent.</div>
+            </div>
+
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Total</div>
+              <div style={{ marginTop: 10, fontWeight: 900 }}>${money(computedTotal)}</div>
             </div>
           </div>
 
-          <div className={ui.field}>
-            <label className={ui.label}>Notes (optional)</label>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.9, marginBottom: 8 }}>Line items</div>
+
+            <div style={{ display: "grid", gap: 10 }}>
+              {lineItems.map((li, idx) => {
+                const qty = Number(li.quantity);
+                const unit = Number(li.unit_price);
+                const lineTotal = (Number.isFinite(qty) ? qty : 0) * (Number.isFinite(unit) ? unit : 0);
+
+                return (
+                  <div
+                    key={idx}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1.8fr 0.6fr 0.8fr 0.8fr auto",
+                      gap: 8,
+                      alignItems: "end",
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 800, opacity: 0.8 }}>Description</div>
+                      <input
+                        style={{ width: "100%", marginTop: 6, padding: 10 }}
+                        value={li.description}
+                        onChange={(e) => updateLineItem(idx, { description: e.target.value })}
+                        placeholder="e.g., Sponsored content — IG reel"
+                        disabled={saving}
+                      />
+                    </div>
+
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 800, opacity: 0.8 }}>Qty</div>
+                      <input
+                        style={{ width: "100%", marginTop: 6, padding: 10 }}
+                        type="number"
+                        step="0.01"
+                        value={li.quantity}
+                        onChange={(e) => updateLineItem(idx, { quantity: e.target.value })}
+                        disabled={saving}
+                      />
+                    </div>
+
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 800, opacity: 0.8 }}>Unit</div>
+                      <input
+                        style={{ width: "100%", marginTop: 6, padding: 10 }}
+                        type="number"
+                        step="0.01"
+                        value={li.unit_price}
+                        onChange={(e) => updateLineItem(idx, { unit_price: e.target.value })}
+                        disabled={saving}
+                      />
+                    </div>
+
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 800, opacity: 0.8 }}>Line total</div>
+                      <div style={{ marginTop: 10, fontWeight: 900 }}>${money(lineTotal)}</div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        type="button"
+                        className={ui.btn}
+                        onClick={() => removeLineItemRow(idx)}
+                        disabled={saving || lineItems.length === 1}
+                      >
+                        −
+                      </button>
+                      {idx === lineItems.length - 1 ? (
+                        <button type="button" className={ui.btn} onClick={addLineItemRow} disabled={saving}>
+                          +
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800, opacity: 0.9 }}>Notes (optional)</div>
             <textarea
-              className={ui.textarea}
+              style={{ width: "100%", marginTop: 6, padding: 10, minHeight: 90 }}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              placeholder="Invoice #, period covered, deliverables, payment terms, etc."
+              placeholder="Invoice #, period covered, payment terms, etc."
+              disabled={saving}
             />
           </div>
 
-          <div className={ui.formActions}>
-            <button type="button" className={ui.btn} onClick={closeAddModal}>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 8 }}>
+            <button type="button" className={ui.btn} onClick={closeModal} disabled={saving}>
               Cancel
             </button>
-
-            <button type="submit" className={`${ui.btn} ${ui.btnPrimary}`} disabled={!workspaceId}>
-              Add invoice
+            <button type="submit" className={`${ui.btn} ${ui.btnPrimary}`} disabled={!workspaceId || saving}>
+              {saving ? "Saving…" : mode === "edit" ? "Save changes" : "Add invoice"}
             </button>
           </div>
         </form>
       </Modal>
 
+      {/* List */}
       <div className={ui.grid}>
         <div className={`${ui.card} ${ui.span2}`}>
           <div className={ui.cardHeader}>
             <div>
-              <h2 className={ui.h2}>List</h2>
+              <h2 className={ui.h2}>Invoices</h2>
               <div className={ui.cardSub}>
-                {showAll ? "Showing all statuses." : "Showing draft / sent only."}
+                {showAll ? "All invoices" : "Open invoices (draft/sent)"} • {invoices.length} shown
               </div>
             </div>
           </div>
@@ -385,27 +722,53 @@ export default function InvoicesPage() {
               <div className={ui.item}>
                 <div>
                   <div className={ui.itemTitle}>No invoices yet.</div>
-                  <div className={ui.itemMeta}>Click “Add invoice” to create one.</div>
+                  <div className={ui.itemMeta}>Create one with “Add invoice”.</div>
                 </div>
               </div>
             ) : (
               invoices.map((inv) => {
                 const sponsor = inv.sponsor_id ? sponsorNameById.get(inv.sponsor_id) : "No sponsor";
+                const items = inv.invoice_items || [];
+
                 return (
-                  <div key={inv.id} className={ui.item}>
+                  <div key={inv.id} className={ui.item} style={{ alignItems: "flex-start" }}>
                     <div>
                       <div className={ui.itemTitle}>
-                        {sponsor} — ${Number(inv.amount).toFixed(2)}
+                        {inv.invoice_number ? (
+                          <span style={{ opacity: 0.85, fontWeight: 950, marginRight: 8 }}>
+                            {inv.invoice_number}
+                          </span>
+                        ) : null}
+                        {sponsor} — ${money(inv.amount)}{" "}
+                        <span style={{ opacity: 0.7, fontWeight: 800, marginLeft: 8 }}>({inv.status})</span>
                       </div>
+
                       <div className={ui.itemMeta}>
-                        status: {inv.status}
-                        {inv.sent_date ? ` • sent ${inv.sent_date}` : ""}
+                        {inv.sent_date ? `sent ${inv.sent_date}` : "not sent"}
                         {inv.paid_date ? ` • paid ${inv.paid_date}` : ""}
+                        {items.length ? ` • ${items.length} line item${items.length === 1 ? "" : "s"}` : ""}
                       </div>
-                      {inv.notes ? <div className={ui.itemMeta}>{inv.notes}</div> : null}
+
+                      {items.length ? (
+                        <div className={ui.itemMeta} style={{ marginTop: 10 }}>
+                          {items.map((it) => (
+                            <div key={it.id} style={{ marginTop: 4 }}>
+                              • {it.description} — {money(it.quantity)} × ${money(it.unit_price)}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {inv.notes ? <div className={ui.itemMeta} style={{ marginTop: 10 }}>{inv.notes}</div> : null}
                     </div>
 
-                    <div className={ui.actionsRow}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <button className={ui.btn} onClick={() => openEditModal(inv)}>
+                        Edit
+                      </button>
+                      <button className={ui.btn} onClick={() => downloadInvoicePdf(inv)}>
+                        Download Invoice PDF
+                        </button>
                       {inv.status === "draft" ? (
                         <button className={ui.btn} onClick={() => updateInvoiceStatus(inv.id, "sent")}>
                           Mark sent
